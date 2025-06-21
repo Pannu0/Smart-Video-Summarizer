@@ -1,0 +1,829 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/optflow.hpp>
+#include <opencv2/face.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
+#include <fstream>
+#include <cstdio>
+#include <algorithm>
+#include <thread>
+#include <future>
+
+using namespace cv;
+using namespace std;
+
+struct Scene {
+    double start_time;
+    double end_time;
+    double score; // Combined video + audio score
+    double video_score; // Original video score
+    double audio_score; // New audio score
+};
+
+// Audio segment information
+struct AudioSegment {
+    double start_time;
+    double end_time;
+    string type; // "speech", "music", "silence", "loud"
+    double value; // Loudness (LUFS), silence duration, or other metric
+};
+
+// Format seconds to hh:mm:ss
+template<typename T>
+string formatTime(T seconds) {
+    int hrs = static_cast<int>(seconds / 3600);
+    int mins = static_cast<int>((seconds - hrs * 3600) / 60);
+    int secs = static_cast<int>(seconds - hrs * 3600 - mins * 60);
+    stringstream ss;
+    ss << setfill('0') << setw(2) << hrs << ":"
+       << setfill('0') << setw(2) << mins << ":"
+       << setfill('0') << setw(2) << secs;
+    return ss.str();
+}
+
+// Format seconds to hh:mm:ss.mmm for precise ffmpeg timestamps
+template<typename T>
+string formatPreciseTime(T seconds) {
+    int hrs = static_cast<int>(seconds / 3600);
+    int mins = static_cast<int>((seconds - hrs * 3600) / 60);
+    int secs = static_cast<int>(seconds - hrs * 3600 - mins * 60);
+    int ms = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
+    stringstream ss;
+    ss << setfill('0') << setw(2) << hrs << ":"
+       << setfill('0') << setw(2) << mins << ":"
+       << setfill('0') << setw(2) << secs << "."
+       << setfill('0') << setw(3) << ms;
+    return ss.str();
+}
+
+// Parse FFmpeg silencedetect output
+vector<AudioSegment> parseSilenceDetect(const string& logFile) {
+    vector<AudioSegment> segments;
+    ifstream file(logFile);
+    string line;
+    double lastSilenceEnd = 0.0;
+
+    while (getline(file, line)) {
+        if (line.find("[silencedetect @") != string::npos) {
+            if (line.find("silence_start") != string::npos) {
+                size_t pos = line.find("silence_start: ");
+                if (pos != string::npos) {
+                    double start = stod(line.substr(pos + 15));
+                    if (start > lastSilenceEnd && lastSilenceEnd > 0.0) {
+                        segments.push_back({lastSilenceEnd, start, "non_silence", 0.0});
+                    }
+                }
+            } else if (line.find("silence_end") != string::npos) {
+                size_t pos = line.find("silence_end: ");
+                if (pos != string::npos) {
+                    double end = stod(line.substr(pos + 13));
+                    pos = line.find("silence_duration: ");
+                    double duration = (pos != string::npos) ? stod(line.substr(pos + 18)) : 0.0;
+                    segments.push_back({end - duration, end, "silence", duration});
+                    lastSilenceEnd = end;
+                }
+            }
+        }
+    }
+    file.close();
+    return segments;
+}
+
+// Parse FFmpeg ebur128 loudness output
+vector<AudioSegment> parseLoudness(const string& logFile, double loudnessThreshold = -23.0) {
+    vector<AudioSegment> segments;
+    ifstream file(logFile);
+    string line;
+    double lastTime = 0.0;
+    double segmentStart = 0.0;
+    bool inLoudSegment = false;
+
+    while (getline(file, line)) {
+        if (line.find("[Parsed_ebur128_0 @") != string::npos) {
+            size_t pos = line.find("t: ");
+            if (pos != string::npos) {
+                double time = stod(line.substr(pos + 3));
+                pos = line.find("I: ");
+                if (pos != string::npos) {
+                    string lufsStr = line.substr(pos + 3);
+                    lufsStr = lufsStr.substr(0, lufsStr.find(" LUFS"));
+                    double lufs = stod(lufsStr);
+
+                    if (lufs > loudnessThreshold && !inLoudSegment) {
+                        segmentStart = lastTime;
+                        inLoudSegment = true;
+                    } else if (lufs <= loudnessThreshold && inLoudSegment) {
+                        segments.push_back({segmentStart, time, "loud", lufs});
+                        inLoudSegment = false;
+                    }
+                    lastTime = time;
+                }
+            }
+        }
+    }
+    if (inLoudSegment) {
+        segments.push_back({segmentStart, lastTime, "loud", 0.0});
+    }
+    file.close();
+    return segments;
+}
+
+// Analyze audio using FFmpeg
+vector<AudioSegment> analyzeAudio(const string& videoFile, double duration) {
+    vector<AudioSegment> segments;
+
+    // 1. Silence detection
+    string silenceCmd = "ffmpeg -i \"" + videoFile + "\" -af silencedetect=noise=-30dB:d=0.5 -f null - 2> silence_log.txt";
+    cout << "Running silence detection..." << endl;
+    system(silenceCmd.c_str());
+    auto silenceSegments = parseSilenceDetect("silence_log.txt");
+    segments.insert(segments.end(), silenceSegments.begin(), silenceSegments.end());
+
+    // 2. Loudness analysis
+    string loudnessCmd = "ffmpeg -i \"" + videoFile + "\" -af ebur128=peak=true -f null - 2> loudness_log.txt";
+    cout << "Running loudness analysis..." << endl;
+    system(loudnessCmd.c_str());
+    auto loudSegments = parseLoudness("loudness_log.txt");
+    segments.insert(segments.end(), loudSegments.begin(), loudSegments.end());
+
+    // 3. Basic speech/music heuristic based on non-silence segments
+    for (auto& seg : segments) {
+        if (seg.type == "non_silence") {
+            // Heuristic: Short non-silent segments with moderate loudness are likely speech
+            // Longer segments or very loud ones are likely music
+            double duration = seg.end_time - seg.start_time;
+            seg.type = (duration < 10.0) ? "speech" : "music";
+            seg.value = duration;
+        }
+    }
+
+    // Sort segments by start time
+    sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) {
+        return a.start_time < b.start_time;
+    });
+
+    // Merge overlapping segments, prioritizing speech > music > loud > silence
+    vector<AudioSegment> merged;
+    if (!segments.empty()) {
+        AudioSegment current = segments[0];
+        for (size_t i = 1; i < segments.size(); ++i) {
+            if (segments[i].start_time <= current.end_time) {
+                // Overlap: Keep the segment with higher priority
+                if (segments[i].type == "speech" || 
+                    (segments[i].type == "music" && current.type != "speech") ||
+                    (segments[i].type == "loud" && current.type == "silence")) {
+                    current = segments[i];
+                }
+                current.end_time = max(current.end_time, segments[i].end_time);
+            } else {
+                merged.push_back(current);
+                current = segments[i];
+            }
+        }
+        merged.push_back(current);
+    }
+
+    return merged;
+}
+
+// Assign audio scores to scenes
+void assignAudioScores(vector<Scene>& scenes, const vector<AudioSegment>& audioSegments) {
+    for (auto& scene : scenes) {
+        double audioScore = 0.0;
+        double overlapDuration = 0.0;
+
+        for (const auto& seg : audioSegments) {
+            double start = max(scene.start_time, seg.start_time);
+            double end = min(scene.end_time, seg.end_time);
+            double duration = max(0.0, end - start);
+
+            if (duration > 0) {
+                double weight = 0.0;
+                if (seg.type == "speech") weight = 1.0; // High priority for speech
+                else if (seg.type == "music") weight = 0.7; // Medium priority for music
+                else if (seg.type == "loud") weight = 0.5; // Lower priority for loud
+                else if (seg.type == "silence") weight = 0.1; // Lowest priority for silence
+
+                audioScore += weight * (duration / (scene.end_time - scene.start_time));
+                overlapDuration += duration;
+            }
+        }
+
+        // Normalize audio score based on coverage
+        if (overlapDuration > 0) {
+            audioScore /= (scene.end_time - scene.start_time);
+        } else {
+            audioScore = 0.1; // Default low score if no audio data
+        }
+
+        scene.audio_score = audioScore;
+        // Combine video and audio scores (60% video, 40% audio)
+        scene.score = 0.6 * scene.video_score + 0.4 * audioScore;
+    }
+}
+
+// New Feature 1: Emotion-Based Scene Scoring
+// Analyzes facial expressions in scenes to assign emotion-based scores, enhancing scene selection
+double computeEmotionScore(VideoCapture& cap, double start_time, double end_time, double fps) {
+    // Load Haar cascade for face detection
+    CascadeClassifier face_cascade;
+    string cascade_path = samples::findFile("haarcascades/haarcascade_frontalface_default.xml");
+    if (!face_cascade.load(cascade_path)) {
+        cerr << "Error: Cannot load face cascade classifier" << endl;
+        return 0.0;
+    }
+
+    double emotion_score = 0.0;
+    int frame_count = 0;
+    int face_detections = 0;
+
+    // Sample frames within the scene
+    int start_frame = static_cast<int>(start_time * fps);
+    int end_frame = static_cast<int>(end_time * fps);
+    int frame_step = max(1, (end_frame - start_frame) / 10); // Sample up to 10 frames
+
+    for (int i = start_frame; i < end_frame; i += frame_step) {
+        cap.set(CAP_PROP_POS_FRAMES, i);
+        Mat frame;
+        cap >> frame;
+        if (frame.empty()) continue;
+
+        Mat gray;
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
+        equalizeHist(gray, gray);
+
+        // Detect faces
+        vector<Rect> faces;
+        face_cascade.detectMultiScale(gray, faces, 1.1, 3, 0, Size(30, 30));
+
+        if (!faces.empty()) {
+            face_detections++;
+            // Simple heuristic: Larger faces (closer to camera) indicate higher emotional intensity
+            for (const auto& face : faces) {
+                double face_area = face.width * face.height;
+                double frame_area = frame.cols * frame.rows;
+                emotion_score += min(1.0, face_area / (frame_area * 0.1)); // Normalize contribution
+            }
+        }
+        frame_count++;
+    }
+
+    // Average score, weighted by face detection frequency
+    if (frame_count > 0) {
+        emotion_score = (face_detections > 0) ? (emotion_score / frame_count) * (face_detections / static_cast<double>(frame_count)) : 0.0;
+    }
+
+    return min(1.0, emotion_score);
+}
+
+// New Feature 2: Motion Trajectory Analysis
+// Tracks object motion trajectories using optical flow clustering to identify dynamic scenes
+double computeMotionTrajectoryScore(VideoCapture& cap, double start_time, double end_time, double fps) {
+    Mat prevGray, currGray;
+    vector<Point2f> prevPoints, currPoints;
+    vector<uchar> status;
+    vector<float> err;
+
+    int start_frame = static_cast<int>(start_time * fps);
+    int end_frame = static_cast<int>(end_time * fps);
+    int frame_step = max(1, (end_frame - start_frame) / 5); // Sample up to 5 frames
+
+    double trajectory_score = 0.0;
+    int valid_trajectories = 0;
+
+    // Initialize first frame
+    cap.set(CAP_PROP_POS_FRAMES, start_frame);
+    Mat frame;
+    cap >> frame;
+    if (frame.empty()) return 0.0;
+    cvtColor(frame, prevGray, COLOR_BGR2GRAY);
+
+    // Detect good features to track
+    goodFeaturesToTrack(prevGray, prevPoints, 100, 0.01, 10);
+
+    for (int i = start_frame + frame_step; i < end_frame; i += frame_step) {
+        cap.set(CAP_PROP_POS_FRAMES, i);
+        cap >> frame;
+        if (frame.empty()) break;
+
+        cvtColor(frame, currGray, COLOR_BGR2GRAY);
+        calcOpticalFlowPyrLK(prevGray, currGray, prevPoints, currPoints, status, err);
+
+        double total_displacement = 0.0;
+        int valid_points = 0;
+
+        for (size_t j = 0; j < prevPoints.size(); ++j) {
+            if (status[j]) {
+                double dx = currPoints[j].x - prevPoints[j].x;
+                double dy = currPoints[j].y - prevPoints[j].y;
+                total_displacement += sqrt(dx * dx + dy * dy);
+                valid_points++;
+            }
+        }
+
+        if (valid_points > 0) {
+            trajectory_score += total_displacement / valid_points;
+            valid_trajectories++;
+        }
+
+        prevGray = currGray.clone();
+        prevPoints = currPoints;
+        currPoints.clear();
+        goodFeaturesToTrack(prevGray, prevPoints, 100, 0.01, 10);
+    }
+
+    // Normalize score
+    if (valid_trajectories > 0) {
+        trajectory_score /= valid_trajectories;
+        trajectory_score = min(1.0, trajectory_score / 50.0); // Normalize based on typical displacement
+    }
+
+    return trajectory_score;
+}
+
+// New Feature 3: Color Histogram Dynamics
+// Analyzes color distribution changes to detect visually striking scenes
+double computeColorDynamicsScore(VideoCapture& cap, double start_time, double end_time, double fps) {
+    int start_frame = static_cast<int>(start_time * fps);
+    int end_frame = static_cast<int>(end_time * fps);
+    int frame_step = max(1, (end_frame - start_frame) / 5); // Sample up to 5 frames
+
+    vector<Mat> prevHists(3);
+    double color_score = 0.0;
+    int comparisons = 0;
+
+    // Histogram setup
+    int histSize = 64;
+    float range[] = {0, 256};
+    const float* histRange = {range};
+    int channels[] = {0};
+
+    cap.set(CAP_PROP_POS_FRAMES, start_frame);
+    Mat frame;
+    cap >> frame;
+    if (frame.empty()) return 0.0;
+
+    // Split into color channels and compute initial histograms
+    vector<Mat> bgr_planes;
+    split(frame, bgr_planes);
+    for (int c = 0; c < 3; ++c) {
+        calcHist(&bgr_planes[c], 1, channels, Mat(), prevHists[c], 1, &histSize, &histRange);
+        normalize(prevHists[c], prevHists[c]);
+    }
+
+    for (int i = start_frame + frame_step; i < end_frame; i += frame_step) {
+        cap.set(CAP_PROP_POS_FRAMES, i);
+        cap >> frame;
+        if (frame.empty()) break;
+
+        split(frame, bgr_planes);
+        vector<Mat> currHists(3);
+        double hist_diff = 0.0;
+
+        for (int c = 0; c < 3; ++c) {
+            calcHist(&bgr_planes[c], 1, channels, Mat(), currHists[c], 1, &histSize, &histRange);
+            normalize(currHists[c], currHists[c]);
+            hist_diff += compareHist(prevHists[c], currHists[c], HISTCMP_BHATTACHARYYA);
+            prevHists[c] = currHists[c].clone();
+        }
+
+        color_score += hist_diff / 3.0; // Average across channels
+        comparisons++;
+    }
+
+    // Normalize score
+    if (comparisons > 0) {
+        color_score /= comparisons;
+        color_score = min(1.0, color_score);
+    }
+
+    return color_score;
+}
+
+vector<Scene> detectScenes(VideoCapture &cap, const vector<AudioSegment>& audioSegments, double threshold = 0.4) {
+    vector<Scene> scenes;
+    Mat prevGray, currGray;
+    Mat prevHist, currHist;
+
+    const double fps = cap.get(CAP_PROP_FPS);
+    const int totalFrames = static_cast<int>(cap.get(CAP_PROP_FRAME_COUNT));
+    
+    cout << "Video stats: " << totalFrames << " frames at " << fps << " FPS" << endl;
+    
+    // Optimization parameters
+    const int frame_skip = 5;
+    const Size processing_size(640, 360);
+    const double motion_weight = 0.6;
+    const double flow_norm_factor = 15.0;
+    const int min_scene_frames = fps * 1.5;
+
+    cap.set(CAP_PROP_POS_FRAMES, 0);
+    Mat first;
+    cap >> first;
+    if (first.empty()) {
+        cout << "Error: First frame is empty!" << endl;
+        return scenes;
+    }
+
+    cout << "First frame loaded, dimensions: " << first.size() << endl;
+    
+    resize(first, first, processing_size);
+    cvtColor(first, prevGray, COLOR_BGR2GRAY);
+    
+    // Histogram setup
+    const int histSize = 256;
+    const float range[] = {0, 256};
+    const float* histRange = {range};
+    calcHist(&prevGray, 1, 0, Mat(), prevHist, 1, &histSize, &histRange);
+    normalize(prevHist, prevHist);
+
+    double lastCutTime = 0;
+    int frames_since_last_cut = 0;
+    int processed_frames = 0;
+    
+    int high_score_count = 0;
+    const int required_high_scores = 3;
+    
+    for(int i = frame_skip; i < totalFrames; i += frame_skip) {
+        cap.set(CAP_PROP_POS_FRAMES, i);
+        Mat frame;
+        cap >> frame;
+        if(frame.empty()) {
+            cout << "Empty frame at position " << i << endl;
+            break;
+        }
+
+        resize(frame, frame, processing_size);
+        cvtColor(frame, currGray, COLOR_BGR2GRAY);
+
+        try {
+            Mat flow(currGray.size(), CV_32FC2);
+            calcOpticalFlowFarneback(prevGray, currGray, flow,
+                                   0.5, 3, 15, 3, 5, 1.2, 0);
+
+            Mat flowParts[2];
+            split(flow, flowParts);
+            Mat magnitude, angle;
+            cartToPolar(flowParts[0], flowParts[1], magnitude, angle);
+            double avg_motion = mean(magnitude)[0];
+            double motion_score = min(avg_motion / flow_norm_factor, 1.0);
+
+            calcHist(&currGray, 1, 0, Mat(), currHist, 1, &histSize, &histRange);
+            normalize(currHist, currHist);
+            double hist_diff = compareHist(prevHist, currHist, HISTCMP_BHATTACHARYYA);
+
+            double video_score = (motion_weight * motion_score) + 
+                               ((1 - motion_weight) * hist_diff);
+
+            frames_since_last_cut += frame_skip;
+            
+            if (frames_since_last_cut >= min_scene_frames) {
+                if (video_score > threshold) {
+                    high_score_count++;
+                    if (high_score_count >= required_high_scores) {
+                        double t = i / fps;
+                        scenes.push_back({lastCutTime, t, video_score, video_score, 0.0});
+                        lastCutTime = t;
+                        frames_since_last_cut = 0;
+                        high_score_count = 0;
+                        cout << "Scene cut detected at " << formatTime(t) << " (video score: " << video_score << ")" << endl;
+                    }
+                } else {
+                    high_score_count = 0;
+                }
+            }
+
+            prevGray = currGray.clone();
+            prevHist = currHist.clone();
+        }
+        catch (const cv::Exception& e) {
+            cerr << "OpenCV error: " << e.what() << endl;
+            break;
+        }
+
+        processed_frames++;
+        
+        if(i % (frame_skip * 20) == 0) {
+            cout << "\rProcessing: " << fixed << setprecision(1)
+                 << (i * 100.0 / totalFrames) << "% (" << i << "/" << totalFrames << ")" << flush;
+        }
+    }
+    cout << "\nProcessed " << processed_frames << " frames" << endl;
+
+    const double duration = totalFrames / fps;
+    if (lastCutTime < duration) {
+        scenes.push_back({lastCutTime, duration, 0.0, 0.0, 0.0});
+    }
+    
+    cout << "Detected " << scenes.size() << " scenes (before filtering)" << endl;
+    
+    vector<Scene> filtered_scenes;
+    for (auto& scene : scenes) {
+        if (scene.end_time - scene.start_time >= 1.0) {
+            filtered_scenes.push_back(scene);
+        }
+    }
+    
+    cout << "After filtering: " << filtered_scenes.size() << " scenes" << endl;
+    
+    // Assign audio scores
+    assignAudioScores(filtered_scenes, audioSegments);
+    
+    return filtered_scenes;
+}
+
+struct VideoInfo {
+    int width;
+    int height;
+    double fps;
+    string codec;
+};
+
+VideoInfo getVideoInfo(const string& filename) {
+    VideoInfo info;
+    VideoCapture cap(filename);
+    
+    if (!cap.isOpened()) {
+        cerr << "Failed to open video for info extraction: " << filename << endl;
+        return info;
+    }
+    
+    info.width = static_cast<int>(cap.get(CAP_PROP_FRAME_WIDTH));
+    info.height = static_cast<int>(cap.get(CAP_PROP_FRAME_HEIGHT));
+    info.fps = cap.get(CAP_PROP_FPS);
+    
+    int ex = static_cast<int>(cap.get(CAP_PROP_FOURCC));
+    char fourcc[] = {(char)(ex & 0XFF), (char)((ex & 0XFF00) >> 8),
+                    (char)((ex & 0XFF0000) >> 16), (char)((ex & 0XFF000000) >> 24), 0};
+    info.codec = fourcc;
+    
+    cap.release();
+    return info;
+}
+
+string createFffmpegEncodeCommand(const string& input, const string& output, 
+                               double start_time, double duration,
+                               const VideoInfo& info) {
+    string start = formatPreciseTime(start_time);
+    
+    stringstream ss;
+    ss << "ffmpeg -y -ss " << start << " -i \"" << input << "\" -t " << duration
+       << " -c:v libx264 -preset fast -crf 22"
+       << " -c:a aac -b:a 128k"
+       << " -vsync 1 -async 1"
+       << " -pix_fmt yuv420p"
+       << " -movflags +faststart"
+       << " \"" << output << "\" 2>> ffmpeg_log.txt";
+       
+    return ss.str();
+}
+
+int main() {
+    string input;
+    cout << "Enter local video path or YouTube link: ";
+    getline(cin, input);
+
+    string videoFile = input;
+    const string ytOutput = "downloaded_input.mp4";
+
+    if (input.find("youtube.com") != string::npos || input.find("youtu.be") != string::npos) {
+        cout << "Downloading from YouTube...\n";
+        string cmd = "yt-dlp -f 18 -o \"" + ytOutput + "\" \"" + input + "\"";
+
+        if (system(cmd.c_str()) != 0) {
+            cerr << "❌ Failed to download video." << endl;
+            return -1;
+        }
+        videoFile = ytOutput;
+    }
+
+    cout << "Opening video file: " << videoFile << endl;
+    VideoCapture cap(videoFile);
+    if (!cap.isOpened()) {
+        cerr << "❌ Could not open video: " << videoFile << endl;
+        if (videoFile == ytOutput) remove(ytOutput.c_str());
+        return -1;
+    }
+
+    const double fps = cap.get(CAP_PROP_FPS);
+    const int totalFrames = static_cast<int>(cap.get(CAP_PROP_FRAME_COUNT));
+    const double originalDuration = totalFrames / fps;
+
+    cout << "Video opened successfully. Duration: " << formatTime(originalDuration) 
+         << " (" << totalFrames << " frames at " << fps << " FPS)" << endl;
+
+    VideoInfo videoInfo = getVideoInfo(videoFile);
+    cout << "Video properties: " << videoInfo.width << "x" << videoInfo.height 
+         << " @ " << videoInfo.fps << "fps, codec: " << videoInfo.codec << endl;
+
+    // Audio analysis
+    cout << "Starting audio analysis..." << endl;
+    auto audioSegments = analyzeAudio(videoFile, originalDuration);
+    cout << "Detected " << audioSegments.size() << " audio segments" << endl;
+    for (const auto& seg : audioSegments) {
+        cout << "Audio segment: " << formatTime(seg.start_time) << " - " << formatTime(seg.end_time)
+             << " (" << seg.type << ", value: " << seg.value << ")" << endl;
+    }
+
+    // Scene detection
+    cout << "Starting scene detection..." << endl;
+    auto scenes = detectScenes(cap, audioSegments, 0.5);
+    cout << "Detected " << scenes.size() << " scenes" << endl;
+
+    if (scenes.empty()) {
+        cerr << "❌ No scenes were detected." << endl;
+        if (videoFile == ytOutput) remove(ytOutput.c_str());
+        return -1;
+    }
+
+    // Scene selection
+    cout << "Selecting important scenes..." << endl;
+    
+    vector<Scene> merged_scenes;
+    if (!scenes.empty()) {
+        Scene current = scenes[0];
+        for (size_t i = 1; i < scenes.size(); i++) {
+            if (scenes[i].start_time - current.start_time < 3.0) {
+                current.end_time = scenes[i].end_time;
+                current.score = max(current.score, scenes[i].score);
+                current.video_score = max(current.video_score, scenes[i].video_score);
+                current.audio_score = max(current.audio_score, scenes[i].audio_score);
+            } else {
+                merged_scenes.push_back(current);
+                current = scenes[i];
+            }
+        }
+        merged_scenes.push_back(current);
+    }
+    
+    cout << "After merging short scenes: " << merged_scenes.size() << " scenes" << endl;
+    
+    for (auto& scene : merged_scenes) {
+        double duration = scene.end_time - scene.start_time;
+        double length_factor = 1.0;
+        if (duration < 5.0) length_factor = duration / 5.0;
+        else if (duration > 30.0) length_factor = 30.0 / duration;
+        
+        scene.score = scene.score * length_factor;
+    }
+
+    sort(merged_scenes.begin(), merged_scenes.end(), [](auto &a, auto &b) { return a.score > b.score; });
+    
+    const double maxAllowed = originalDuration * 0.3;
+    vector<Scene> picks;
+    double accum = 0;
+    
+    for (auto &s: merged_scenes) {
+        const double d = s.end_time - s.start_time;
+        if (d < 1.0) continue;
+        
+        if (accum + d <= maxAllowed) {
+            picks.push_back(s);
+            accum += d;
+            cout << "Selected scene: " << formatTime(s.start_time) << " - " << formatTime(s.end_time) 
+                 << " (duration: " << d << "s, score: " << s.score 
+                 << ", video: " << s.video_score << ", audio: " << s.audio_score << ")" << endl;
+        }
+        if (accum >= maxAllowed) break;
+    }
+    
+    sort(picks.begin(), picks.end(), [](auto &a, auto &b) { return a.start_time < b.start_time; });
+    
+    cout << "Selected " << picks.size() << " scenes for the summary" << endl;
+
+    cout << "Releasing video capture before FFmpeg operations..." << endl;
+    cap.release();
+    
+    vector<string> temps;
+    ofstream listF("concat_list.txt");
+    
+    if (!listF.is_open()) {
+        cerr << "❌ Failed to create concat_list.txt" << endl;
+        if (videoFile == ytOutput) remove(ytOutput.c_str());
+        return -1;
+    }
+    
+    cout << "Extracting clips (with re-encoding for better synchronization)..." << endl;
+    bool extractionSuccess = true;
+    system("mkdir -p temp_clips");
+    
+    for (size_t i = 0; i < picks.size(); ++i) {
+        auto &s = picks[i];
+        string tmp = "temp_clips/clip_" + to_string(i+1) + ".mp4";
+        temps.push_back(tmp);
+        
+        double duration = s.end_time - s.start_time;
+        string cmd = createFffmpegEncodeCommand(videoFile, tmp, s.start_time, duration, videoInfo);
+        
+        cout << "  • Extracting clip " << (i+1) << " of " << picks.size() << ": " 
+             << formatTime(s.start_time) << " to " << formatTime(s.end_time) << endl;
+        cout << "    Command: " << cmd << endl;
+        
+        int result = system(cmd.c_str());
+        if (result != 0) {
+            cerr << "⚠ Warning: Failed to extract clip " << (i+1) << " (code " << result << ")" << endl;
+            extractionSuccess = false;
+        }
+        
+        VideoCapture clipCheck(tmp);
+        if (!clipCheck.isOpened()) {
+            cerr << "⚠ Warning: Clip file " << tmp << " wasn't created properly." << endl;
+            extractionSuccess = false;
+        } else {
+            Mat testFrame;
+            clipCheck >> testFrame;
+            if (testFrame.empty()) {
+                cerr << "⚠ Warning: Clip file " << tmp << " doesn't contain valid video." << endl;
+                extractionSuccess = false;
+            } else {
+                listF << "file '" << tmp << "'\n";
+            }
+            clipCheck.release();
+        }
+    }
+    listF.close();
+    
+    if (!extractionSuccess) {
+        cerr << "❌ Some clips failed to extract correctly." << endl;
+        cout << "Checking FFmpeg logs for more information..." << endl;
+        system("type ffmpeg_log.txt || cat ffmpeg_log.txt");
+    } else {
+        cout << "All clips extracted successfully." << endl;
+    }
+
+    bool concatResult = false;
+    if (extractionSuccess) {
+        cout << "Building final summary video..." << endl;
+        
+        cout << "Waiting a moment for all file operations to complete..." << endl;
+        this_thread::sleep_for(chrono::seconds(2));
+        
+        ifstream checkList("concat_list.txt");
+        string listContent((istreambuf_iterator<char>(checkList)), istreambuf_iterator<char>());
+        checkList.close();
+        
+        if (listContent.empty()) {
+            cerr << "❌ concat_list.txt is empty, nothing to concatenate." << endl;
+        } else {
+            cout << "Content of concat_list.txt:" << endl;
+            system("type concat_list.txt || cat concat_list.txt");
+            
+            string concatCmd = "ffmpeg -y -f concat -safe 0 -i concat_list.txt"
+                              " -c:v libx264 -preset medium -crf 22"
+                              " -c:a aac -b:a 128k"
+                              " -vsync 1 -async 1"
+                              " -pix_fmt yuv420p"
+                              " -movflags +faststart"
+                              " summary_video.mp4 2> ffmpeg_concat_log.txt";
+                              
+            cout << "Running: " << concatCmd << endl;
+            int result = system(concatCmd.c_str());
+            
+            if (result != 0) {
+                cerr << "❌ Failed to concatenate clips. Error code: " << result << endl;
+                cout << "FFmpeg concat log:" << endl;
+                system("type ffmpeg_concat_log.txt || cat ffmpeg_concat_log.txt");
+                
+                cout << "Trying alternative concatenation method..." << endl;
+                string altCmd = "ffmpeg -y -f concat -safe 0 -i concat_list.txt"
+                               " -c copy"
+                               " -fflags +genpts"
+                               " summary_video_alt.mp4 2> ffmpeg_alt_log.txt";
+                               
+                result = system(altCmd.c_str());
+                if (result == 0) {
+                    cout << "Alternative method succeeded. Output: summary_video_alt.mp4" << endl;
+                    concatResult = true;
+                } else {
+                    cerr << "❌ Alternative method also failed." << endl;
+                }
+            } else {
+                concatResult = true;
+            }
+        }
+    } else {
+        cerr << "❌ Skipping concatenation due to clip extraction failures." << endl;
+    }
+
+    cout << "Cleaning up temporary files..." << endl;
+    for (auto &f: temps) remove(f.c_str());
+    remove("concat_list.txt");
+    remove("silence_log.txt");
+    remove("loudness_log.txt");
+    system("rm -rf temp_clips || rmdir /s /q temp_clips");
+    if (videoFile == ytOutput) remove(ytOutput.c_str());
+
+    if (concatResult) {
+        cout << "✅ Summary complete: summary_video.mp4 (" 
+             << fixed << setprecision(1) << accum 
+             << "s / " << originalDuration << "s)\n";
+    } else {
+        cout << "❌ Summary generation failed. Please check the error messages above." << endl;
+    }
+    
+    return 0;
+}
